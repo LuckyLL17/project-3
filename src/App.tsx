@@ -3,11 +3,12 @@ import { Canvas, useFrame } from '@react-three/fiber';
 import { Html, Line, OrbitControls, Sky, Text } from '@react-three/drei';
 import * as THREE from 'three';
 
-type Status = '进行中' | '已救援' | '失败' | '暂停';
-type Snapshot = { x: number; y: number; z: number; stamina: number; temperature: number; rope: number; anchors: number; rescued: boolean; elapsed: number; status: Status; message: string };
+type Status = '进行中' | '撤离中' | '已救援' | '失败' | '暂停';
+type Snapshot = { x: number; y: number; z: number; stamina: number; temperature: number; rope: number; anchors: number; connected: boolean; rescued: boolean; elapsed: number; status: Status; message: string };
 type Command = 'anchor' | 'rescue' | 'tighten' | 'restart' | 'pause' | null;
 const VICTIM = new THREE.Vector3(5.2, 1.2, -4.8);
 const START = new THREE.Vector3(-5.2, 1.05, 5.4);
+const SAFE_RADIUS = 2.3;
 
 function useKeys() {
   const keys = useRef<Record<string, boolean>>({});
@@ -74,10 +75,19 @@ function Player({ position, heading }: { position: THREE.Vector3; heading: numbe
   </group>;
 }
 
-function Victim({ rescued }: { rescued: boolean }) {
-  return <group position={VICTIM} rotation={[0, -.5, 0]}>
-    {!rescued && <><mesh position={[0, .35, 0]} rotation={[0, 0, .2]} castShadow><capsuleGeometry args={[.22, .75, 5, 10]} /><meshStandardMaterial color="#f0a54e" /></mesh><mesh position={[0, .82, 0]}><sphereGeometry args={[.25, 14, 10]} /><meshStandardMaterial color="#e0b18a" /></mesh><Html position={[0, 1.4, 0]} center><span className="victim-tag">受困者 · 需要救援</span></Html></>}
-    {rescued && <Html position={[0, .2, 0]} center><span className="rescued-tag">✓ 已固定</span></Html>}
+function Victim({ position, connected, rescued }: { position: THREE.Vector3; connected: boolean; rescued: boolean }) {
+  return <group position={position} rotation={[0, -.5, 0]}>
+    <mesh position={[0, .35, 0]} rotation={[0, 0, connected ? 0 : .2]} castShadow><capsuleGeometry args={[.22, .75, 5, 10]} /><meshStandardMaterial color="#f0a54e" /></mesh>
+    <mesh position={[0, .82, 0]}><sphereGeometry args={[.25, 14, 10]} /><meshStandardMaterial color="#e0b18a" /></mesh>
+    <Html position={[0, 1.4, 0]} center><span className={rescued ? 'rescued-tag' : 'victim-tag'}>{rescued ? '✓ 已获救' : connected ? '受困者 · 撤离中' : '受困者 · 需要救援'}</span></Html>
+  </group>;
+}
+
+function SafeZone() {
+  return <group position={[START.x, 0, START.z]}>
+    <mesh position={[0, .05, 0]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[1.82, SAFE_RADIUS, 48]} /><meshBasicMaterial color="#8fe6b0" transparent opacity={.6} /></mesh>
+    <mesh position={[0, .045, 0]} rotation={[-Math.PI / 2, 0, 0]}><circleGeometry args={[1.82, 48]} /><meshBasicMaterial color="#8fe6b0" transparent opacity={.12} /></mesh>
+    <Html position={[0, 1.15, 0]} center><span className="safe-tag">安全区 · 出发点</span></Html>
   </group>;
 }
 
@@ -91,60 +101,115 @@ function GameScene({ commandRef, onSnapshot }: { commandRef: React.MutableRefObj
   const temperature = useRef(74);
   const rope = useRef(10);
   const anchors = useRef<THREE.Vector3[]>([]);
-  const rescued = useRef(false);
+  const connected = useRef(false);
+  const victimPos = useRef(VICTIM.clone());
   const elapsed = useRef(0);
   const lastSnapshot = useRef(0);
   const status = useRef<Status>('进行中');
+  const resumeStatus = useRef<Status>('进行中');
   const message = useRef('沿雪坡前进，找到受困者并建立安全锚点。');
-  const previousCommand = useRef<Command>(null);
   const [renderPosition, setRenderPosition] = useState(START.clone());
   const [renderHeading, setRenderHeading] = useState(0);
   const [renderAnchors, setRenderAnchors] = useState<THREE.Vector3[]>([]);
+  const [renderVictim, setRenderVictim] = useState(VICTIM.clone());
+  const [renderConnected, setRenderConnected] = useState(false);
   const [renderRescued, setRenderRescued] = useState(false);
 
+  const emitSnapshot = () => onSnapshot({ x: player.current.x, y: player.current.y, z: player.current.z, stamina: stamina.current, temperature: temperature.current, rope: rope.current, anchors: anchors.current.length, connected: connected.current, rescued: status.current === '已救援', elapsed: elapsed.current, status: status.current, message: message.current });
+  const syncRender = () => { setRenderPosition(player.current.clone()); setRenderHeading(heading.current); setRenderAnchors(anchors.current.map(point => point.clone())); setRenderVictim(victimPos.current.clone()); setRenderConnected(connected.current); setRenderRescued(status.current === '已救援'); };
+
   useFrame((_, delta) => {
+    const command = commandRef.current;
+    if (command) {
+      commandRef.current = null;
+      if (command === 'restart') {
+        player.current.copy(START); heading.current = 0; stamina.current = 82; temperature.current = 74; rope.current = 10;
+        anchors.current = []; connected.current = false; victimPos.current.copy(VICTIM); elapsed.current = 0;
+        status.current = '进行中'; message.current = '重新开始救援：先建立锚点，靠近受困者后按 E 连接。';
+      } else if (command === 'pause') {
+        if (status.current === '暂停') { status.current = resumeStatus.current; message.current = '继续行动。'; }
+        else if (status.current === '进行中' || status.current === '撤离中') { resumeStatus.current = status.current; status.current = '暂停'; message.current = '行动已暂停，按 Esc 继续。'; }
+      } else if (status.current === '进行中' || status.current === '撤离中') {
+        if (command === 'anchor') {
+          if (stamina.current > 12 && anchors.current.length < 3) { anchors.current = [...anchors.current, player.current.clone()]; stamina.current -= 8; rope.current = Math.max(4, rope.current - 2); message.current = '冰镐已打入雪壁，安全锚点建立。'; } else message.current = '无法建立更多锚点：体力不足或锚点已达上限。';
+        }
+        if (command === 'tighten') { if (anchors.current.length) { rope.current = Math.max(2, rope.current - 1.5); message.current = '正在收紧救援绳索，下降路线更稳定。'; } else message.current = '请先建立至少一个冰镐锚点。'; }
+        if (command === 'rescue') {
+          if (connected.current) message.current = '正在撤离中：护送受困者返回出发点的绿色安全区。';
+          else {
+            const distance = Math.hypot(player.current.x - VICTIM.x, player.current.z - VICTIM.z);
+            if (distance >= 2.05) message.current = `还未靠近受困者：还差 ${(distance - 2.05).toFixed(1)} m，继续接近后再按 E。`;
+            else if (anchors.current.length === 0) message.current = '还没有安全锚点：先按 Q 打入至少一个冰镐锚点。';
+            else { connected.current = true; status.current = '撤离中'; message.current = '已连接受困者！撤离开始——带他返回出发点安全区，注意体力、体温和绳长。'; }
+          }
+        }
+      }
+      emitSnapshot();
+      syncRender();
+    }
     if (status.current === '暂停' || status.current === '已救援' || status.current === '失败') return;
     elapsed.current += delta;
-    const command = commandRef.current;
-    if (command && command !== previousCommand.current) {
-      previousCommand.current = command;
-      if (command === 'restart') { player.current.copy(START); stamina.current = 82; temperature.current = 74; rope.current = 10; anchors.current = []; rescued.current = false; elapsed.current = 0; status.current = '进行中'; message.current = '重新开始救援。'; }
-      if (command === 'pause') status.current = '暂停';
-      if (command === 'anchor') {
-        if (stamina.current > 12 && anchors.current.length < 3) { anchors.current = [...anchors.current, player.current.clone()]; stamina.current -= 8; rope.current = Math.max(4, rope.current - 2); message.current = '冰镐已打入雪壁，安全锚点建立。'; } else message.current = '无法建立更多锚点：体力不足或锚点已达上限。';
-      }
-      if (command === 'tighten') { if (anchors.current.length) { rope.current = Math.max(2, rope.current - 1.5); message.current = '正在收紧救援绳索，下降路线更稳定。'; } else message.current = '请先建立至少一个冰镐锚点。'; }
-      if (command === 'rescue') { const distance = player.current.distanceTo(VICTIM); if (distance < 2.05 && anchors.current.length > 0 && !rescued.current) { rescued.current = true; status.current = '已救援'; message.current = '受困者已连接主绳，救援成功！'; } else if (distance >= 2.05) message.current = `距离受困者还有 ${Math.max(0, distance - 2).toFixed(1)} m。`; else message.current = '需要先建立安全锚点再连接受困者。'; }
-      commandRef.current = null;
-    }
+    const evacuating = status.current === '撤离中';
     const input = new THREE.Vector3((keys.current.d || keys.current.arrowright ? 1 : 0) - (keys.current.a || keys.current.arrowleft ? 1 : 0), 0, (keys.current.s || keys.current.arrowdown ? 1 : 0) - (keys.current.w || keys.current.arrowup ? 1 : 0));
     const moving = input.lengthSq() > 0;
     if (moving) {
       input.normalize();
       const sprint = keys.current.shift && stamina.current > 1;
-      const speed = sprint ? 3.9 : 2.25;
+      const speed = (sprint ? 3.9 : 2.25) * (evacuating ? .82 : 1);
       player.current.x = THREE.MathUtils.clamp(player.current.x + input.x * speed * delta, -10.2, 10.2);
       player.current.z = THREE.MathUtils.clamp(player.current.z + input.z * speed * delta, -8.2, 8.2);
       heading.current = Math.atan2(input.x, input.z);
-      stamina.current = THREE.MathUtils.clamp(stamina.current + (sprint ? -13 : -4) * delta, 0, 100);
+      stamina.current = THREE.MathUtils.clamp(stamina.current + (sprint ? -13 : -4) * (evacuating ? 1.4 : 1) * delta, 0, 100);
       if (sprint && stamina.current <= 1) message.current = '体力耗尽，停止冲刺。';
     } else stamina.current = THREE.MathUtils.clamp(stamina.current + 2.2 * delta, 0, 100);
     temperature.current = THREE.MathUtils.clamp(temperature.current - (moving ? .34 : .22) * delta, 0, 100);
     if (player.current.distanceTo(new THREE.Vector3(-5, 0, 5)) < 2.1) temperature.current = THREE.MathUtils.clamp(temperature.current + .3 * delta, 0, 100);
-    if (temperature.current <= 0 || stamina.current <= 0) { status.current = '失败'; message.current = temperature.current <= 0 ? '体温过低，救援行动失败。' : '体力耗尽，无法继续攀登。'; }
-    setRenderPosition(player.current.clone()); setRenderHeading(heading.current); setRenderAnchors(anchors.current.map(point => point.clone())); setRenderRescued(rescued.current);
-    if (elapsed.current - lastSnapshot.current > .12) { lastSnapshot.current = elapsed.current; onSnapshot({ x: player.current.x, y: player.current.y, z: player.current.z, stamina: stamina.current, temperature: temperature.current, rope: rope.current, anchors: anchors.current.length, rescued: rescued.current, elapsed: elapsed.current, status: status.current, message: message.current }); }
+    if (evacuating) {
+      const toPlayer = new THREE.Vector3().subVectors(player.current, victimPos.current); toPlayer.y = 0;
+      const gap = toPlayer.length();
+      if (gap > 1.05) victimPos.current.addScaledVector(toPlayer.normalize(), (gap - 1.05) * Math.min(1, delta * 6));
+      rope.current = Math.max(0, rope.current - (moving ? .5 : .28) * delta);
+      if (Math.hypot(player.current.x - START.x, player.current.z - START.z) < SAFE_RADIUS) { status.current = '已救援'; message.current = '到达安全区！受困者已成功获救，任务完成。'; }
+    }
+    if (status.current !== '已救援') {
+      if (temperature.current <= 0) { status.current = '失败'; message.current = '体温过低，救援行动失败。'; }
+      else if (stamina.current <= 0) { status.current = '失败'; message.current = '体力耗尽，无法继续攀登。'; }
+      else if (evacuating && rope.current <= 0) { status.current = '失败'; message.current = '救援绳耗尽，撤离失败。'; }
+    }
+    syncRender();
+    if (elapsed.current - lastSnapshot.current > .12) { lastSnapshot.current = elapsed.current; emitSnapshot(); }
   });
-  const ropePoints = [renderPosition.clone().add(new THREE.Vector3(0, .55, 0)), ...renderAnchors.map(point => point.clone().add(new THREE.Vector3(0, .3, 0))), VICTIM.clone().add(new THREE.Vector3(0, .3, 0))];
-  return <><Sky distance={450} sunPosition={[-10, 8, -10]} inclination={.52} azimuth={.23} /><ambientLight intensity={1.1} /><directionalLight position={[-5, 10, 3]} intensity={2.5} castShadow shadow-mapSize={[1024, 1024]} /><hemisphereLight color="#d7f5ff" groundColor="#6d8a95" intensity={.8} /><Mountain /><SnowGround /><CableLine /><Tower position={[-8, 0, 5]} height={6.2} /><Tower position={[8, 0, -4]} height={6.8} /><CableCar /><Player position={renderPosition} heading={renderHeading} /><Victim rescued={renderRescued} /><Anchors positions={renderAnchors} />{ropePoints.length > 1 && <Line points={ropePoints} color={renderRescued ? '#f4d485' : '#d8e3df'} lineWidth={1.4} dashed={false} />}<OrbitControls enablePan={false} minDistance={10} maxDistance={25} maxPolarAngle={Math.PI / 2.05} target={[0, 1, 0]} /> </>;
+  const ropePoints = [renderPosition.clone().add(new THREE.Vector3(0, .55, 0)), ...renderAnchors.map(point => point.clone().add(new THREE.Vector3(0, .3, 0))), renderVictim.clone().add(new THREE.Vector3(0, .3, 0))];
+  return <><Sky distance={450} sunPosition={[-10, 8, -10]} inclination={.52} azimuth={.23} /><ambientLight intensity={1.1} /><directionalLight position={[-5, 10, 3]} intensity={2.5} castShadow shadow-mapSize={[1024, 1024]} /><hemisphereLight color="#d7f5ff" groundColor="#6d8a95" intensity={.8} /><Mountain /><SnowGround /><CableLine /><Tower position={[-8, 0, 5]} height={6.2} /><Tower position={[8, 0, -4]} height={6.8} /><CableCar /><SafeZone /><Player position={renderPosition} heading={renderHeading} /><Victim position={renderVictim} connected={renderConnected} rescued={renderRescued} /><Anchors positions={renderAnchors} />{ropePoints.length > 1 && <Line points={ropePoints} color={renderConnected ? '#f4d485' : '#d8e3df'} lineWidth={1.4} dashed={false} />}<OrbitControls enablePan={false} minDistance={10} maxDistance={25} maxPolarAngle={Math.PI / 2.05} target={[0, 1, 0]} /> </>;
 }
 
 function Meter({ label, value, color, suffix = '%' }: { label: string; value: number; color: string; suffix?: string }) { return <div className="meter"><div className="meter-head"><span>{label}</span><b>{Math.round(value)}{suffix}</b></div><div className="meter-track"><i style={{ width: `${Math.max(0, Math.min(100, value))}%`, background: color }} /></div></div>; }
 
 export default function App() {
   const commandRef = useRef<Command>(null);
-  const [snapshot, setSnapshot] = useState<Snapshot>({ x: START.x, y: START.y, z: START.z, stamina: 82, temperature: 74, rope: 10, anchors: 0, rescued: false, elapsed: 0, status: '进行中', message: '沿雪坡前进，找到受困者并建立安全锚点。' });
+  const [snapshot, setSnapshot] = useState<Snapshot>({ x: START.x, y: START.y, z: START.z, stamina: 82, temperature: 74, rope: 10, anchors: 0, connected: false, rescued: false, elapsed: 0, status: '进行中', message: '沿雪坡前进，找到受困者并建立安全锚点。' });
   const issue = (command: Command) => { commandRef.current = command; };
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.repeat) return;
+      const key = event.key.toLowerCase();
+      if (key === 'q') issue('anchor');
+      else if (key === 'e') issue('rescue');
+      else if (key === 'r') issue('tighten');
+      else if (key === 'escape') issue('pause');
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+  const active = snapshot.status === '进行中' || snapshot.status === '撤离中';
   const distance = Math.hypot(snapshot.x - VICTIM.x, snapshot.z - VICTIM.z);
-  return <div className="game-shell"><header className="topbar"><div><span className="eyebrow">ALPINE RESCUE / MISSION 07</span><h1>雪山缆车救援行动</h1></div><div className="mission-status"><span className={snapshot.status === '进行中' ? 'live-dot' : 'status-dot'} />{snapshot.status}<span className="mission-time">{Math.floor(snapshot.elapsed / 60).toString().padStart(2, '0')}:{Math.floor(snapshot.elapsed % 60).toString().padStart(2, '0')}</span></div></header><main className="game-layout"><section className="viewport-card"><div className="scene"><Canvas shadows camera={{ position: [11, 9, 13], fov: 42 }}><GameScene commandRef={commandRef} onSnapshot={setSnapshot} /></Canvas><div className="controls-hint"><span>WASD / 方向键 移动</span><span>Shift 冲刺</span><span>拖拽旋转视角</span></div><div className="crosshair">＋</div></div></section><aside className="hud"><section className="objective"><div className="section-kicker">当前任务 / RESCUE OBJECTIVE</div><h2>抵达受困者位置并完成绳索固定</h2><div className="objective-row"><span className={distance < 2.05 ? 'check done' : 'check'}>{distance < 2.05 ? '✓' : '○'}</span><span>接近受困者 <b>{distance.toFixed(1)} m</b></span></div><div className="objective-row"><span className={snapshot.anchors > 0 ? 'check done' : 'check'}>{snapshot.anchors > 0 ? '✓' : '○'}</span><span>建立安全锚点 <b>{snapshot.anchors}/3</b></span></div><div className="objective-row"><span className={snapshot.rescued ? 'check done' : 'check'}>{snapshot.rescued ? '✓' : '○'}</span><span>连接主绳并救援</span></div></section><section className="vitals"><div className="section-kicker">救援员状态 / VITALS</div><Meter label="体力 STAMINA" value={snapshot.stamina} color="#78d8a1" /><Meter label="体温 BODY TEMP" value={snapshot.temperature} color={snapshot.temperature < 30 ? '#ed7968' : '#75cfee'} /></section><section className="equipment"><div className="section-kicker">装备与绳索 / GEAR</div><div className="gear-row"><div className="gear-icon">⛏</div><div><b>冰镐锚点</b><small>用于固定救援路线</small></div><strong>{snapshot.anchors}/3</strong></div><div className="gear-row"><div className="gear-icon rope-icon">⌁</div><div><b>救援绳</b><small>剩余可用长度</small></div><strong>{snapshot.rope.toFixed(1)} m</strong></div></section><section className="actions"><div className="section-kicker">操作 / ACTIONS</div><div className="action-grid"><button onClick={() => issue('anchor')} disabled={snapshot.status !== '进行中'}><span>Q</span>打入冰镐锚点</button><button onClick={() => issue('rescue')} disabled={snapshot.status !== '进行中'}><span>E</span>连接受困者</button><button onClick={() => issue('tighten')} disabled={snapshot.status !== '进行中'}><span>R</span>收紧救援绳</button><button onClick={() => issue('pause')} disabled={snapshot.status !== '进行中'}><span>Esc</span>暂停行动</button></div></section><div className={`mission-message ${snapshot.status === '失败' ? 'danger' : snapshot.status === '已救援' ? 'success' : ''}`}><span>◈</span>{snapshot.message}</div><button className="restart" onClick={() => issue('restart')}>重新开始任务</button></aside></main><footer className="footer"><span>风速 32 km/h · 体感 -18°C · 能见度 420 m</span><span>局部雪崩警报：中等</span></footer></div>;
+  const safeDistance = Math.hypot(snapshot.x - START.x, snapshot.z - START.z);
+  const hint = snapshot.status === '已救援' ? '✓ 已到达安全区，受困者获救！可点击“重新开始任务”再来一局。'
+    : snapshot.status === '失败' ? '任务失败，点击“重新开始任务”再试一次。'
+    : snapshot.status === '暂停' ? '行动已暂停，按 Esc 或点击“继续行动”恢复。'
+    : snapshot.status === '撤离中' ? `正在撤离：护送受困者返回出发点安全区（还有 ${safeDistance.toFixed(1)} m），留意体力、体温与绳长。`
+    : distance >= 2.05 ? `未靠近受困者：还差 ${(distance - 2.05).toFixed(1)} m，继续接近后按 E 连接。`
+    : snapshot.anchors === 0 ? '缺少安全锚点：先按 Q 打入至少一个冰镐锚点。'
+    : '已就位：按 E 连接救援绳，开始撤离。';
+  return <div className="game-shell"><header className="topbar"><div><span className="eyebrow">ALPINE RESCUE / MISSION 07</span><h1>雪山缆车救援行动</h1></div><div className="mission-status"><span className={active ? 'live-dot' : 'status-dot'} />{snapshot.status}<span className="mission-time">{Math.floor(snapshot.elapsed / 60).toString().padStart(2, '0')}:{Math.floor(snapshot.elapsed % 60).toString().padStart(2, '0')}</span></div></header><main className="game-layout"><section className="viewport-card"><div className="scene"><Canvas shadows camera={{ position: [11, 9, 13], fov: 42 }}><GameScene commandRef={commandRef} onSnapshot={setSnapshot} /></Canvas><div className="controls-hint"><span>WASD / 方向键 移动</span><span>Shift 冲刺</span><span>Q 锚点 · E 连接 · R 收绳</span><span>拖拽旋转视角</span></div><div className="crosshair">＋</div></div></section><aside className="hud"><section className="objective"><div className="section-kicker">当前任务 / RESCUE OBJECTIVE</div><h2>连接受困者并护送回出发点安全区</h2><div className="objective-row"><span className={distance < 2.05 || snapshot.connected ? 'check done' : 'check'}>{distance < 2.05 || snapshot.connected ? '✓' : '○'}</span><span>接近受困者 <b>{distance.toFixed(1)} m</b></span></div><div className="objective-row"><span className={snapshot.anchors > 0 ? 'check done' : 'check'}>{snapshot.anchors > 0 ? '✓' : '○'}</span><span>建立安全锚点 <b>{snapshot.anchors}/3</b></span></div><div className="objective-row"><span className={snapshot.connected ? 'check done' : 'check'}>{snapshot.connected ? '✓' : '○'}</span><span>连接主绳（按 E）</span></div><div className="objective-row"><span className={snapshot.rescued ? 'check done' : 'check'}>{snapshot.rescued ? '✓' : '○'}</span><span>护送回安全区{snapshot.status === '撤离中' ? <b>{safeDistance.toFixed(1)} m</b> : null}</span></div></section><section className="vitals"><div className="section-kicker">救援员状态 / VITALS</div><Meter label="体力 STAMINA" value={snapshot.stamina} color="#78d8a1" /><Meter label="体温 BODY TEMP" value={snapshot.temperature} color={snapshot.temperature < 30 ? '#ed7968' : '#75cfee'} /></section><section className="equipment"><div className="section-kicker">装备与绳索 / GEAR</div><div className="gear-row"><div className="gear-icon">⛏</div><div><b>冰镐锚点</b><small>用于固定救援路线</small></div><strong>{snapshot.anchors}/3</strong></div><div className="gear-row"><div className="gear-icon rope-icon">⌁</div><div><b>救援绳</b><small>{snapshot.status === '撤离中' ? '撤离中持续消耗' : '剩余可用长度'}</small></div><strong>{snapshot.rope.toFixed(1)} m</strong></div></section><section className="actions"><div className="section-kicker">操作 / ACTIONS</div><div className="action-grid"><button onClick={() => issue('anchor')} disabled={!active}><span>Q</span>打入冰镐锚点</button><button onClick={() => issue('rescue')} disabled={!active}><span>E</span>{snapshot.connected ? '撤离中…' : '连接受困者'}</button><button onClick={() => issue('tighten')} disabled={!active}><span>R</span>收紧救援绳</button><button onClick={() => issue('pause')} disabled={!active && snapshot.status !== '暂停'}><span>Esc</span>{snapshot.status === '暂停' ? '继续行动' : '暂停行动'}</button></div><div className="action-hint">{hint}</div></section><div className={`mission-message ${snapshot.status === '失败' ? 'danger' : snapshot.status === '已救援' ? 'success' : snapshot.status === '撤离中' ? 'evac' : ''}`}><span>◈</span>{snapshot.message}</div><button className="restart" onClick={() => issue('restart')}>重新开始任务</button></aside></main><footer className="footer"><span>风速 32 km/h · 体感 -18°C · 能见度 420 m</span><span>局部雪崩警报：中等</span></footer></div>;
 }
